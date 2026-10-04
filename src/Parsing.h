@@ -245,7 +245,6 @@ namespace Parsing
 	struct CachedModDirectory
 	{
 		std::filesystem::path path;
-		std::vector<CachedDirectoryEntry> entries;
 		std::vector<CachedSubModDirectory> subModDirectories;
 	};
 
