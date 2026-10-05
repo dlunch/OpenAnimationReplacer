@@ -42,6 +42,7 @@ static void SetLowIOPriority()
 #endif
 
 static std::atomic<uint32_t> g_precachedHashCount{ 0 };
+static std::atomic<int64_t> g_precachedHashNanoseconds{ 0 };
 
 namespace Parsing
 {
@@ -1679,7 +1680,9 @@ namespace Parsing
 			return;
 		}
 
+		const auto startTime = std::chrono::steady_clock::now();
 		AnimationFileHashCache::CalculateHash(*filename);
+		g_precachedHashNanoseconds.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - startTime).count(), std::memory_order_relaxed);
 		g_precachedHashCount.fetch_add(1, std::memory_order_relaxed);
 	}
 
@@ -1887,7 +1890,7 @@ namespace Parsing
 #endif
 
 		logger::info("Starting directory cache...");
-		const auto startTime = std::chrono::high_resolution_clock::now();
+		const auto startTime = std::chrono::steady_clock::now();
 
 		static constexpr auto oarFolderName = "openanimationreplacer"sv;
 		static constexpr auto legacyFolderName = "dynamicanimationreplacer"sv;
@@ -1902,13 +1905,18 @@ namespace Parsing
 
 		std::vector<CachedOARDirectory> oarDirs;
 		std::vector<CachedLegacyDirectory> legacyDirs;
+		std::chrono::steady_clock::duration animationDirectoryTime{};
+		uint64_t meshEntries = 0;
+		uint64_t meshDirectories = 0;
 
 		try {
 			for (std::filesystem::recursive_directory_iterator i(meshesDir), end; i != end; ++i) {
+				++meshEntries;
 				const auto& entry = *i;
 				if (!Utils::IsDirectory(entry)) {
 					continue;
 				}
+				++meshDirectories;
 
 				if (!IsPathValid(entry.path())) {
 					i.disable_recursion_pending();
@@ -1916,17 +1924,29 @@ namespace Parsing
 				}
 
 				std::string stemString = entry.path().stem().string();
-				if (Utils::CompareStringsIgnoreCase(stemString, oarFolderName)) {
+				const bool bIsOAR = Utils::CompareStringsIgnoreCase(stemString, oarFolderName);
+				if (!bIsOAR && !Utils::CompareStringsIgnoreCase(stemString, legacyFolderName)) {
+					continue;
+				}
+
+				const auto directoryStartTime = std::chrono::steady_clock::now();
+				const auto hashStartTime = g_precachedHashNanoseconds.load(std::memory_order_relaxed);
+				if (bIsOAR) {
 					CachedOARDirectory cachedOAR;
 					CacheOARDirectoryContents(entry, cachedOAR);
 					oarDirs.push_back(std::move(cachedOAR));
-					i.disable_recursion_pending();
-				} else if (Utils::CompareStringsIgnoreCase(stemString, legacyFolderName)) {
+				} else {
 					CachedLegacyDirectory cachedLegacy;
 					CacheLegacyDirectoryContents(entry, cachedLegacy);
 					legacyDirs.push_back(std::move(cachedLegacy));
-					i.disable_recursion_pending();
 				}
+				i.disable_recursion_pending();
+				const auto directoryTime = std::chrono::steady_clock::now() - directoryStartTime;
+				animationDirectoryTime += directoryTime;
+				logger::info("Cached animation directory {}: {}ms (hash/read: {:.3f}ms included)",
+					entry.path().string(),
+					std::chrono::duration_cast<std::chrono::milliseconds>(directoryTime).count(),
+					ToMilliseconds(g_precachedHashNanoseconds.load(std::memory_order_relaxed) - hashStartTime));
 			}
 		} catch (const std::filesystem::filesystem_error& e) {
 			logger::warn("Error while caching directories: {}", e.what());
@@ -1938,9 +1958,15 @@ namespace Parsing
 			g_directoryCache.legacyDirectories = std::move(legacyDirs);
 		}
 
-		const auto endTime = std::chrono::high_resolution_clock::now();
+		const auto endTime = std::chrono::steady_clock::now();
 		const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
 		const auto hashCount = g_precachedHashCount.load(std::memory_order_relaxed);
+		logger::info("Directory cache timings: mesh discovery {}ms ({} entries, {} directories), animation directories {}ms (hash/read: {:.3f}ms included)",
+			std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime - animationDirectoryTime).count(),
+			meshEntries,
+			meshDirectories,
+			std::chrono::duration_cast<std::chrono::milliseconds>(animationDirectoryTime).count(),
+			ToMilliseconds(g_precachedHashNanoseconds.load(std::memory_order_relaxed)));
 
 		if (Settings::bFilterOutDuplicateAnimations) {
 			logger::info("Directory cache complete: {} OAR directories, {} legacy directories, {} animation hashes ({}ms)",
